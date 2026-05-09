@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -25,9 +26,7 @@ func main() {
 	}
 
 	log.Printf("http server listening at %s\n", srv.Addr)
-	if err := srv.ListenAndServe(); err != nil {
-		if err != http.ErrServerClosed {
-			panic(err)
-		}
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		panic(err)
 	}
 }
