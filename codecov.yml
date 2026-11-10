@@ -1,5 +1,11 @@
+# Explicit floors rather than "no lower than the base commit": the base for
+# v1.0.0 was a 12-line hello-world at 100%, which no real change can match.
 coverage:
   status:
     project:
       default:
+        target: 85%
         threshold: 1%
+    patch:
+      default:
+        target: 80%
