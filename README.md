@@ -51,7 +51,7 @@ curl 'localhost:8080/hello?name=gopher' -H 'Content-Type: application/json' -d '
     "data": "{\"hi\":true}",
     "json": { "hi": true }
   },
-  "server": { "hostname": "echo-7d9f4c", "version": "v1.0.0" },
+  "server": { "hostname": "echo-7d9f4c", "version": "v0.1.0" },
   "request_id": "cda1afb896db4a7d",
   "time": "2026-11-10T08:56:05.391620915Z"
 }
@@ -64,8 +64,8 @@ Prefer a binary? Download one for Linux, macOS, Windows or FreeBSD from
 [Releases](https://github.com/syntaqx/echo-server/releases), or
 `go install github.com/syntaqx/echo-server/cmd/echo-server@latest`.
 
-Image tags: `latest` and `1`, `1.0`, `1.0.0` follow releases; `main` and
-`nightly` track the default branch.
+Image tags: `latest` and versions like `0.1` and `0.1.0` follow releases;
+`main` and `nightly` track the default branch.
 
 ## Shaping the response
 
@@ -198,8 +198,9 @@ containers:
 
 ## As a Go library
 
-The handler can be mounted in any server, including test servers. The API
-follows semantic versioning from v1.0.0.
+The handler can be mounted in any server, including test servers. Until
+v1.0.0 the Go API may change between minor versions; the
+[CHANGELOG](CHANGELOG.md) lists every breaking change.
 
 ```go
 import echo "github.com/syntaqx/echo-server"

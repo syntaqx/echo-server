@@ -1,9 +1,10 @@
 # Changelog
 
 All notable changes to this project are documented here. The project follows
-[Semantic Versioning](https://semver.org) from v1.0.0.
+[Semantic Versioning](https://semver.org); until v1.0.0, minor releases may
+include breaking changes, which are always listed here.
 
-## v1.0.0
+## v0.1.0
 
 The first tagged release, and a rewrite: echo-server now actually echoes.
 
@@ -30,6 +31,7 @@ The first tagged release, and a rewrite: echo-server now actually echoes.
 - Distroless, nonroot, multi-arch images (amd64, arm64, arm/v7) with a built-in
   `HEALTHCHECK`, and release binaries for Linux, macOS, Windows and FreeBSD.
 - Usable as a Go library: `echo.New(echo.Options{})` returns an `http.Handler`.
+  The API may still change before v1.0.0.
 
 ### Security
 

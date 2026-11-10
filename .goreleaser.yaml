@@ -37,6 +37,10 @@ archives:
 checksum:
   name_template: checksums.txt
 
+release:
+  # Tags like v1.0.0-rc.1 are published as GitHub pre-releases.
+  prerelease: auto
+
 changelog:
   use: github
   filters:
