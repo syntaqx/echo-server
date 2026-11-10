@@ -1,2 +1,11 @@
-ignore:
-  - "cmd/**"
+# Explicit floors rather than "no lower than the base commit": before the
+# first release, main was a 12-line hello-world at 100% coverage.
+coverage:
+  status:
+    project:
+      default:
+        target: 85%
+        threshold: 1%
+    patch:
+      default:
+        target: 80%

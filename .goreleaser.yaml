@@ -1,0 +1,49 @@
+# Release binaries for every tag. Container images are built by docker.yml.
+version: 2
+
+project_name: echo-server
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: ./cmd/echo-server
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Tag }}
+    goos: [linux, darwin, windows, freebsd]
+    goarch: [amd64, arm64, arm]
+    goarm: ["7"]
+    ignore:
+      - goos: darwin
+        goarch: arm
+      - goos: windows
+        goarch: arm
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  # Tags like v1.0.0-rc.1 are published as GitHub pre-releases.
+  prerelease: auto
+
+changelog:
+  use: github
+  filters:
+    exclude:
+      - '^Merge pull request'
+      - '^Merge branch'
