@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Method}} {{.Path}} · echo-server</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='5' fill='%2310b981'/><circle cx='16' cy='16' r='10' fill='none' stroke='%2310b981' stroke-width='2' opacity='.6'/><circle cx='16' cy='16' r='15' fill='none' stroke='%2310b981' stroke-width='1.5' opacity='.3'/></svg>">
+<style nonce="{{.Nonce}}">
+:root {
+  --bg: #fafaf9; --panel: #ffffff; --line: #e7e5e4; --text: #1c1917; --muted: #78716c;
+  --accent: #059669; --accent-bg: #ecfdf5; --code-bg: #f5f5f4; --key: #0e7490;
+  --get: #059669; --post: #2563eb; --put: #d97706; --patch: #9333ea; --delete: #dc2626; --other: #57534e;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0c0a09; --panel: #161412; --line: #292524; --text: #e7e5e4; --muted: #a8a29e;
+    --accent: #34d399; --accent-bg: #052e22; --code-bg: #1c1917; --key: #67e8f9;
+    --get: #34d399; --post: #60a5fa; --put: #fbbf24; --patch: #c084fc; --delete: #f87171; --other: #a8a29e;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 var(--sans); }
+main { max-width: 1040px; margin: 0 auto; padding: 32px 16px 64px; }
+code, pre, .mono { font-family: var(--mono); font-size: 13px; }
+a { color: var(--accent); }
+
+header { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; justify-content: space-between; margin-bottom: 24px; }
+.reqline { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.method { font: 700 13px var(--mono); padding: 4px 10px; border-radius: 6px; color: var(--panel); background: var(--other); letter-spacing: .04em; }
+.m-GET { background: var(--get); } .m-POST { background: var(--post); } .m-PUT { background: var(--put); }
+.m-PATCH { background: var(--patch); } .m-DELETE { background: var(--delete); }
+.path { font: 600 22px var(--mono); overflow-wrap: anywhere; }
+.sub { color: var(--muted); font-size: 13px; margin-top: 6px; }
+.meta { text-align: right; color: var(--muted); font-size: 13px; }
+.meta b { color: var(--text); font-weight: 600; }
+
+nav { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 20px; overflow-x: auto; }
+nav button { all: unset; cursor: pointer; padding: 8px 14px; color: var(--muted); border-bottom: 2px solid transparent; margin-bottom: -1px; white-space: nowrap; }
+nav button[aria-selected="true"] { color: var(--text); border-color: var(--accent); }
+nav button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+section[hidden] { display: none; }
+
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); margin-bottom: 16px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-bottom: 16px; }
+.grid .card { margin-bottom: 0; }
+.card h2 { margin: 0; padding: 10px 14px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; }
+.card h2 .count { font-family: var(--mono); text-transform: none; letter-spacing: 0; }
+table { width: 100%; border-collapse: collapse; }
+td { padding: 7px 14px; border-top: 1px solid var(--line); vertical-align: top; font-family: var(--mono); font-size: 13px; }
+tr:first-child td { border-top: 0; }
+td.k { color: var(--key); white-space: nowrap; width: 1%; padding-right: 24px; }
+td.v { overflow-wrap: anywhere; }
+pre { margin: 0; padding: 14px; background: var(--code-bg); overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.empty { padding: 12px 14px; color: var(--muted); font-size: 13px; }
+.pill { display: inline-block; font: 12px var(--mono); padding: 1px 8px; border-radius: 99px; background: var(--accent-bg); color: var(--accent); }
+
+.toolbar { display: flex; justify-content: flex-end; padding: 8px; border-bottom: 1px solid var(--line); gap: 8px; }
+.btn { all: unset; cursor: pointer; font-size: 13px; padding: 5px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--text); }
+.btn:hover { border-color: var(--accent); }
+.btn:focus-visible { outline: 2px solid var(--accent); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--panel); }
+
+.ws-row { display: flex; gap: 8px; padding: 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.ws-row input { flex: 1; min-width: 160px; font: 13px var(--mono); padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--code-bg); color: var(--text); }
+.ws-log { height: 280px; overflow-y: auto; padding: 8px 0; font: 13px var(--mono); }
+.ws-log div { padding: 2px 14px; overflow-wrap: anywhere; }
+.ws-log .out { color: var(--post); } .ws-log .in { color: var(--get); } .ws-log .sys { color: var(--muted); }
+.status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+.status-dot.on { background: var(--get); box-shadow: 0 0 0 3px var(--accent-bg); }
+
+.endpoints td.k a { color: var(--key); text-decoration: none; }
+.endpoints td.k a:hover { text-decoration: underline; }
+footer { margin-top: 32px; color: var(--muted); font-size: 13px; text-align: center; }
+@media (max-width: 600px) { .meta { text-align: left; } .path { font-size: 18px; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <div class="reqline">
+        <span class="method m-{{.Method}}">{{.Method}}</span>
+        <span class="path">{{.Path}}</span>
+      </div>
+      <div class="sub mono">{{.Proto}} · {{.Host}}{{if .TLS}} · {{.TLS.Version}}{{end}}</div>
+    </div>
+    <div class="meta">
+      answered by <b>{{.Server.Hostname}}</b><br>
+      <span class="mono">{{.RequestID}}</span> · {{.Time.Format "15:04:05.000 MST"}}
+    </div>
+  </header>
+
+  <nav role="tablist">
+    <button role="tab" aria-selected="true" data-tab="request">Request</button>
+    <button role="tab" aria-selected="false" data-tab="json">JSON</button>
+    <button role="tab" aria-selected="false" data-tab="curl">curl</button>
+    <button role="tab" aria-selected="false" data-tab="ws">WebSocket</button>
+    <button role="tab" aria-selected="false" data-tab="endpoints">Endpoints</button>
+  </nav>
+
+  <section id="tab-request" role="tabpanel">
+    <div class="grid">
+      <div class="card">
+        <h2>Connection</h2>
+        <table>
+          <tr><td class="k">client ip</td><td class="v">{{.ClientIP}}</td></tr>
+          <tr><td class="k">remote addr</td><td class="v">{{.RemoteAddr}}</td></tr>
+          <tr><td class="k">protocol</td><td class="v">{{.Proto}}</td></tr>
+          <tr><td class="k">url</td><td class="v">{{.URL}}</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h2>TLS</h2>
+        {{with .TLS}}
+        <table>
+          <tr><td class="k">version</td><td class="v">{{.Version}}</td></tr>
+          <tr><td class="k">cipher</td><td class="v">{{.CipherSuite}}</td></tr>
+          {{if .ServerName}}<tr><td class="k">sni</td><td class="v">{{.ServerName}}</td></tr>{{end}}
+          {{if .NegotiatedProtocol}}<tr><td class="k">alpn</td><td class="v">{{.NegotiatedProtocol}}</td></tr>{{end}}
+          {{range .PeerCertificates}}<tr><td class="k">client cert</td><td class="v">{{.}}</td></tr>{{end}}
+        </table>
+        {{else}}<div class="empty">Plain-text connection. If you came through a proxy, check X-Forwarded-Proto below.</div>{{end}}
+      </div>
+    </div>
+
+    {{if .Query}}
+    <div class="card">
+      <h2>Query <span class="count">{{len .Query}}</span></h2>
+      <table>{{range $k := sorted .Query}}<tr><td class="k">{{$k}}</td><td class="v">{{join (index $.Query $k) ", "}}</td></tr>{{end}}</table>
+    </div>
+    {{end}}
+
+    <div class="card">
+      <h2>Headers <span class="count">{{len .Headers}}</span></h2>
+      <table>{{range $k := sorted .Headers}}<tr><td class="k">{{$k}}</td><td class="v">{{join (index $.Headers $k) ", "}}</td></tr>{{end}}</table>
+    </div>
+
+    {{if .Cookies}}
+    <div class="card">
+      <h2>Cookies <span class="count">{{len .Cookies}}</span></h2>
+      <table>{{range $k, $v := .Cookies}}<tr><td class="k">{{$k}}</td><td class="v">{{$v}}</td></tr>{{end}}</table>
+    </div>
+    {{end}}
+
+    {{with .Body}}
+    <div class="card">
+      <h2>Body <span class="count">{{.Size}} bytes{{if .Truncated}} · truncated{{end}}</span></h2>
+      {{if .ContentType}}<div class="empty"><span class="pill">{{.ContentType}}</span> <span class="pill">{{.Encoding}}</span></div>{{end}}
+      {{if .Files}}<table>{{range .Files}}<tr><td class="k">{{.Field}}</td><td class="v">{{.Filename}} · {{.ContentType}} · {{.Size}} bytes</td></tr>{{end}}</table>{{end}}
+      {{if .Data}}<pre>{{.Data}}</pre>{{end}}
+    </div>
+    {{end}}
+  </section>
+
+  <section id="tab-json" role="tabpanel" hidden>
+    <div class="card">
+      <div class="toolbar"><button class="btn" data-copy="json-out">Copy</button></div>
+      <pre id="json-out">{{.JSON}}</pre>
+    </div>
+  </section>
+
+  <section id="tab-curl" role="tabpanel" hidden>
+    <div class="card">
+      <div class="toolbar"><button class="btn" data-copy="curl-out">Copy</button></div>
+      <pre id="curl-out">{{.Curl}}</pre>
+    </div>
+  </section>
+
+  <section id="tab-ws" role="tabpanel" hidden>
+    <div class="card">
+      <h2><span><span class="status-dot" id="ws-dot"></span><span id="ws-state">disconnected</span></span><span class="count" id="ws-url"></span></h2>
+      <div class="ws-row">
+        <button class="btn primary" id="ws-toggle">Connect</button>
+        <input id="ws-input" placeholder="Type a message and press Enter" disabled>
+        <button class="btn" id="ws-send" disabled>Send</button>
+      </div>
+      <div class="ws-log" id="ws-log" aria-live="polite"></div>
+    </div>
+  </section>
+
+  <section id="tab-endpoints" role="tabpanel" hidden>
+    <div class="card endpoints">
+      <h2>Routes</h2>
+      <table>
+        <tr><td class="k"><a href="/anything/you/like">/*</a></td><td class="v">Echo the request: JSON for clients, this page for browsers. WebSocket upgrades echo messages back.</td></tr>
+        <tr><td class="k"><a href="{{$.Prefix}}/status/418">{{$.Prefix}}/status/{code}</a></td><td class="v">Echo with the given status code.</td></tr>
+        <tr><td class="k"><a href="{{$.Prefix}}/delay/1500ms">{{$.Prefix}}/delay/{duration}</a></td><td class="v">Echo after a delay, e.g. 250ms or 2s.</td></tr>
+        <tr><td class="k"><a href="{{$.Prefix}}/sse?count=5">{{$.Prefix}}/sse</a></td><td class="v">Server-sent events. <code>?interval=500ms&amp;count=10</code></td></tr>
+        <tr><td class="k"><a href="{{$.Prefix}}/healthz">{{$.Prefix}}/healthz</a></td><td class="v">Liveness probe (also {{$.Prefix}}/livez).</td></tr>
+        <tr><td class="k"><a href="{{$.Prefix}}/readyz">{{$.Prefix}}/readyz</a></td><td class="v">Readiness probe; 503 while draining.</td></tr>
+        <tr><td class="k"><a href="{{$.Prefix}}/metrics">{{$.Prefix}}/metrics</a></td><td class="v">Prometheus metrics.</td></tr>
+      </table>
+    </div>
+    <div class="card endpoints">
+      <h2>Response controls — any path</h2>
+      <table>
+        <tr><td class="k">X-Echo-Status</td><td class="v">Status code to respond with. Query: <code>?echo_status=503</code></td></tr>
+        <tr><td class="k">X-Echo-Delay</td><td class="v">Wait before responding. Query: <code>?echo_delay=2s</code></td></tr>
+        <tr><td class="k">X-Echo-Header</td><td class="v">Add a response header, repeatable. Query: <code>?echo_header=Cache-Control:no-store</code></td></tr>
+        <tr><td class="k">X-Echo-Format</td><td class="v"><code>json</code>, <code>text</code> (HTTP wire format), <code>html</code> or <code>raw</code> (body only). Query: <code>?echo_format=text</code></td></tr>
+      </table>
+    </div>
+  </section>
+
+  <footer>echo-server {{.Server.Version}} · <a href="https://github.com/syntaqx/echo-server">github.com/syntaqx/echo-server</a></footer>
+</main>
+<script nonce="{{.Nonce}}">
+(() => {
+  const tabs = document.querySelectorAll('nav [role=tab]');
+  const show = (name) => {
+    tabs.forEach(t => t.setAttribute('aria-selected', String(t.dataset.tab === name)));
+    document.querySelectorAll('[role=tabpanel]').forEach(p => p.hidden = p.id !== 'tab-' + name);
+  };
+  tabs.forEach(t => t.addEventListener('click', () => { show(t.dataset.tab); history.replaceState(null, '', '#' + t.dataset.tab); }));
+  if (location.hash && document.getElementById('tab-' + location.hash.slice(1))) show(location.hash.slice(1));
+
+  document.querySelectorAll('[data-copy]').forEach(b => b.addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(document.getElementById(b.dataset.copy).textContent); b.textContent = 'Copied'; }
+    catch { b.textContent = 'Copy failed'; }
+    setTimeout(() => b.textContent = 'Copy', 1500);
+  }));
+
+  const $ = (id) => document.getElementById(id);
+  const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+  $('ws-url').textContent = url;
+  let ws = null;
+  const log = (cls, text) => {
+    const d = document.createElement('div');
+    d.className = cls;
+    d.textContent = (cls === 'out' ? '→ ' : cls === 'in' ? '← ' : '· ') + text;
+    $('ws-log').append(d);
+    $('ws-log').scrollTop = $('ws-log').scrollHeight;
+  };
+  const setState = (on) => {
+    $('ws-dot').classList.toggle('on', on);
+    $('ws-state').textContent = on ? 'connected' : 'disconnected';
+    $('ws-toggle').textContent = on ? 'Disconnect' : 'Connect';
+    $('ws-input').disabled = $('ws-send').disabled = !on;
+    if (on) $('ws-input').focus();
+  };
+  const send = () => {
+    const v = $('ws-input').value;
+    if (!ws || ws.readyState !== 1 || !v) return;
+    ws.send(v); log('out', v); $('ws-input').value = '';
+  };
+  $('ws-toggle').addEventListener('click', () => {
+    if (ws) { ws.close(1000); return; }
+    ws = new WebSocket(url);
+    log('sys', 'connecting to ' + url);
+    ws.onopen = () => { setState(true); log('sys', 'connected'); };
+    ws.onmessage = (e) => log('in', typeof e.data === 'string' ? e.data : '[binary]');
+    ws.onclose = (e) => { setState(false); log('sys', 'closed (' + e.code + ')'); ws = null; };
+    ws.onerror = () => log('sys', 'error');
+  });
+  $('ws-send').addEventListener('click', send);
+  $('ws-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+})();
+</script>
+</body>
+</html>
