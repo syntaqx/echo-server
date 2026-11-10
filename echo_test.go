@@ -86,7 +86,7 @@ func TestEchoJSON(t *testing.T) {
 	if e.ClientIP != "203.0.113.7" {
 		t.Errorf("client_ip = %q", e.ClientIP)
 	}
-	if e.Cookies["session"] != "s3cr3t" {
+	if len(e.Cookies) != 1 || e.Cookies[0] != (Cookie{Name: "session", Value: "s3cr3t"}) {
 		t.Errorf("cookies = %v", e.Cookies)
 	}
 	if e.Body == nil || e.Body.Data != `{"hello":"world"}` {
@@ -124,7 +124,7 @@ func TestEchoBodies(t *testing.T) {
 	t.Run("truncated", func(t *testing.T) {
 		req, _ := http.NewRequest(http.MethodPost, srv.URL, strings.NewReader(strings.Repeat("a", 100)))
 		_, body := do(t, req)
-		if e := decode(t, body); !e.Body.Truncated || e.Body.Size != 16 {
+		if e := decode(t, body); !e.Body.Truncated || e.Body.Size != 100 || len(e.Body.Data) != 16 {
 			t.Errorf("body = %+v", e.Body)
 		}
 	})
@@ -321,7 +321,7 @@ func TestMetrics(t *testing.T) {
 
 func TestWebSocket(t *testing.T) {
 	srv := newServer(t, Options{})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/any/path", nil)
@@ -433,7 +433,7 @@ func readAll(t *testing.T, r io.Reader) string {
 
 func TestWebSocketMetrics(t *testing.T) {
 	srv := newServer(t, Options{})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
 	if err != nil {

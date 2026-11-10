@@ -9,12 +9,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -22,30 +23,51 @@ import (
 
 // Echo is the reflection of a single request, as returned to the client.
 type Echo struct {
-	Method     string              `json:"method"`
-	URL        string              `json:"url"`
-	Path       string              `json:"path"`
+	Method string `json:"method"`
+	URL    string `json:"url"`
+	Path   string `json:"path"`
+	// Query is parsed from the raw query string, splitting only on "&", so
+	// values containing ";" are kept rather than dropped.
 	Query      map[string][]string `json:"query,omitempty"`
 	Proto      string              `json:"protocol"`
 	Host       string              `json:"host"`
 	RemoteAddr string              `json:"remote_addr"`
 	ClientIP   string              `json:"client_ip"`
 	Headers    map[string][]string `json:"headers"`
-	Cookies    map[string]string   `json:"cookies,omitempty"`
-	Body       *Body               `json:"body,omitempty"`
-	TLS        *TLSInfo            `json:"tls,omitempty"`
-	Server     ServerInfo          `json:"server"`
-	RequestID  string              `json:"request_id"`
-	Time       time.Time           `json:"time"`
+	// ContentLength is the declared body length, or -1 when unknown (for
+	// example a chunked body).
+	ContentLength int64 `json:"content_length"`
+	// TransferEncoding lists the transfer codings, such as "chunked". Go
+	// removes the Transfer-Encoding header, so it is reported here instead.
+	TransferEncoding []string `json:"transfer_encoding,omitempty"`
+	// Cookies are in the order the client sent them; names may repeat.
+	Cookies []Cookie `json:"cookies,omitempty"`
+	Body    *Body    `json:"body,omitempty"`
+	// Trailers are trailing headers sent after a chunked body.
+	Trailers  map[string][]string `json:"trailers,omitempty"`
+	TLS       *TLSInfo            `json:"tls,omitempty"`
+	Server    ServerInfo          `json:"server"`
+	RequestID string              `json:"request_id"`
+	Time      time.Time           `json:"time"`
+}
+
+// Cookie is one request cookie.
+type Cookie struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }
 
 // Body describes the request payload.
 type Body struct {
 	ContentType string `json:"content_type,omitempty"`
-	Size        int64  `json:"size"`
-	Truncated   bool   `json:"truncated,omitempty"`
-	// Encoding is "utf-8" when Data is the body verbatim, or "base64" for
-	// binary payloads.
+	// Size is the full body size in bytes, even when Data is truncated.
+	Size int64 `json:"size"`
+	// Truncated reports that the body exceeded Options.MaxBodyBytes, so Data
+	// holds only the first MaxBodyBytes bytes and the body wasn't parsed.
+	Truncated bool `json:"truncated,omitempty"`
+	// Encoding is "utf-8" when Data is the body verbatim, "base64" for
+	// binary payloads, or "omitted" for multipart uploads with files, which
+	// are summarized in Files instead.
 	Encoding string              `json:"encoding"`
 	Data     string              `json:"data"`
 	JSON     json.RawMessage     `json:"json,omitempty"`
@@ -92,45 +114,77 @@ func (h *Handler) capture(w http.ResponseWriter, r *http.Request) (*Echo, []byte
 		Server:     ServerInfo{Hostname: h.opts.Hostname, Version: h.opts.Version},
 		RequestID:  w.Header().Get("X-Request-Id"),
 		Time:       time.Now().UTC(),
+
+		ContentLength:    r.ContentLength,
+		TransferEncoding: r.TransferEncoding,
+		Query:            parseQuery(r.URL.RawQuery),
 	}
-	if q := r.URL.Query(); len(q) > 0 {
-		e.Query = q
-	}
-	if cs := r.Cookies(); len(cs) > 0 {
-		e.Cookies = make(map[string]string, len(cs))
-		for _, c := range cs {
-			e.Cookies[c.Name] = c.Value
-		}
+	for _, c := range r.Cookies() {
+		e.Cookies = append(e.Cookies, Cookie{Name: c.Name, Value: c.Value})
 	}
 
-	raw, truncated, err := readBody(r.Body, h.opts.MaxBodyBytes)
+	raw, size, err := readBody(r.Body, h.opts.MaxBodyBytes)
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(raw) > 0 || truncated {
-		e.Body = describeBody(r.Header.Get("Content-Type"), raw, truncated)
+	if size > 0 {
+		e.Body = describeBody(r.Header.Get("Content-Type"), raw, size)
+	}
+	// Trailers are only available once the body has been read.
+	if len(r.Trailer) > 0 {
+		e.Trailers = headerMap(r.Trailer)
 	}
 	return e, raw, nil
 }
 
-func readBody(body io.Reader, limit int64) ([]byte, bool, error) {
+// readBody returns up to limit bytes of the body, and the body's full size.
+// The rest is read and discarded so the size is accurate and keep-alive
+// connections stay usable; the server's read timeout bounds how long that
+// can take.
+func readBody(body io.Reader, limit int64) ([]byte, int64, error) {
 	if body == nil || body == http.NoBody {
-		return nil, false, nil
+		return nil, 0, nil
 	}
-	buf, err := io.ReadAll(io.LimitReader(body, limit+1))
+	buf, err := io.ReadAll(io.LimitReader(body, limit))
 	if err != nil {
-		return nil, false, err
+		return nil, 0, err
 	}
-	if int64(len(buf)) > limit {
-		// Drain (bounded) so keep-alive connections stay usable.
-		_, _ = io.CopyN(io.Discard, body, 64<<20)
-		return buf[:limit], true, nil
+	rest, err := io.Copy(io.Discard, body)
+	if err != nil {
+		return nil, 0, err
 	}
-	return buf, false, nil
+	return buf, int64(len(buf)) + rest, nil
 }
 
-func describeBody(contentType string, raw []byte, truncated bool) *Body {
-	b := &Body{ContentType: contentType, Size: int64(len(raw)), Truncated: truncated}
+// parseQuery parses a raw query string like url.ParseQuery, but splits only
+// on "&": url.ParseQuery rejects ";" and drops the whole pair. Undecodable
+// escapes are kept verbatim.
+func parseQuery(raw string) map[string][]string {
+	if raw == "" {
+		return nil
+	}
+	q := map[string][]string{}
+	for part := range strings.SplitSeq(raw, "&") {
+		if part == "" {
+			continue
+		}
+		k, v, _ := strings.Cut(part, "=")
+		k = queryUnescape(k)
+		q[k] = append(q[k], queryUnescape(v))
+	}
+	return q
+}
+
+func queryUnescape(s string) string {
+	if u, err := url.QueryUnescape(s); err == nil {
+		return u
+	}
+	return s
+}
+
+func describeBody(contentType string, raw []byte, size int64) *Body {
+	truncated := size > int64(len(raw))
+	b := &Body{ContentType: contentType, Size: size, Truncated: truncated}
 	if utf8.Valid(raw) {
 		b.Encoding, b.Data = "utf-8", string(raw)
 	} else {
@@ -191,19 +245,12 @@ func parseMultipart(raw []byte, boundary string) (map[string][]string, []File) {
 
 func headerMap(h http.Header) map[string][]string {
 	m := make(map[string][]string, len(h))
-	for k, v := range h {
-		m[k] = v
-	}
+	maps.Copy(m, h)
 	return m
 }
 
 func sortedKeys[V any](m map[string]V) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
+	return slices.Sorted(maps.Keys(m))
 }
 
 func fullURL(r *http.Request) string {
@@ -220,7 +267,7 @@ func fullURL(r *http.Request) string {
 // boundary: any client can set these headers.
 func clientIP(r *http.Request) string {
 	if fwd := r.Header.Get("Forwarded"); fwd != "" {
-		for _, part := range strings.Split(strings.Split(fwd, ",")[0], ";") {
+		for part := range strings.SplitSeq(strings.Split(fwd, ",")[0], ";") {
 			k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
 			if ok && strings.EqualFold(k, "for") {
 				v = strings.Trim(v, `"`)
@@ -272,6 +319,9 @@ func rawRequest(r *http.Request, body []byte, truncated bool) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "%s %s %s\r\n", r.Method, r.URL.RequestURI(), r.Proto)
 	fmt.Fprintf(&sb, "Host: %s\r\n", r.Host)
+	if len(r.TransferEncoding) > 0 {
+		fmt.Fprintf(&sb, "Transfer-Encoding: %s\r\n", strings.Join(r.TransferEncoding, ", "))
+	}
 	for _, k := range sortedKeys(r.Header) {
 		for _, v := range r.Header[k] {
 			fmt.Fprintf(&sb, "%s: %s\r\n", k, v)

@@ -27,9 +27,10 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ github.repository }}
+          # `latest` follows releases only (metadata-action adds it for the
+          # highest semver tag); `main` and `nightly` track the branch.
           tags: |
             type=schedule
-            type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
@@ -57,6 +58,6 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || format('{0}-{1}', steps.meta.outputs.version, github.sha) }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

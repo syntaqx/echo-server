@@ -20,7 +20,7 @@ import (
 func subprotocols(r *http.Request) []string {
 	var out []string
 	for _, v := range r.Header.Values("Sec-WebSocket-Protocol") {
-		for _, p := range strings.Split(v, ",") {
+		for p := range strings.SplitSeq(v, ",") {
 			if p = strings.TrimSpace(p); p != "" {
 				out = append(out, p)
 			}
@@ -42,8 +42,10 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	_ = rc.SetWriteDeadline(time.Time{})
 
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true, // an echo server accepts every origin
-		Subprotocols:       subprotocols(r),
+		// Accept every origin. Cross-site use is safe here: the socket only
+		// echoes what the client itself sends, never cookies or headers.
+		OriginPatterns: []string{"*"},
+		Subprotocols:   subprotocols(r),
 	})
 	if err != nil {
 		return // Accept already wrote the error response
@@ -82,37 +84,40 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 // handleSSE streams server-sent events. Query parameters:
 //
-//	interval  time between events (default 1s, min 10ms)
+//	interval  time between events, 10ms to 1h (default 1s)
 //	count     number of events before closing (default 0 = forever)
 func (h *Handler) handleSSE(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
+	setCORS(w, r)
+	q := parseQuery(r.URL.RawQuery)
 	interval := time.Second
-	if s := q.Get("interval"); s != "" {
-		d, err := h.parseDelay(s)
+	if vs := q["interval"]; len(vs) > 0 {
+		d, err := parseDuration("interval", vs[0], minSSEInterval, maxSSEInterval)
 		if err != nil {
 			httpError(w, http.StatusBadRequest, err)
 			return
 		}
-		interval = max(d, 10*time.Millisecond)
+		interval = d
 	}
 	count := 0
-	if s := q.Get("count"); s != "" {
-		n, err := strconv.Atoi(s)
+	if vs := q["count"]; len(vs) > 0 {
+		n, err := strconv.Atoi(vs[0])
 		if err != nil || n < 0 {
-			httpError(w, http.StatusBadRequest, fmt.Errorf("invalid count %q", s))
+			httpError(w, http.StatusBadRequest, fmt.Errorf("invalid count %q: want 0 (forever) or more", vs[0]))
 			return
 		}
 		count = n
 	}
 
-	rc := http.NewResponseController(w)
-	_ = rc.SetWriteDeadline(time.Time{}) // streams outlive the server's write timeout
-
-	setCORS(w, r)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
 	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return // headers only; streaming would hold the connection forever
+	}
+
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Time{}) // streams outlive the server's write timeout
 
 	ctx := r.Context()
 	ticker := time.NewTicker(interval)
@@ -163,3 +168,8 @@ func (r *recorder) Flush() {
 	r.wroteHeader = true
 	_ = http.NewResponseController(r.ResponseWriter).Flush()
 }
+
+const (
+	minSSEInterval = 10 * time.Millisecond
+	maxSSEInterval = time.Hour
+)

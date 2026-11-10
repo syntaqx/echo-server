@@ -8,8 +8,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -83,6 +87,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if err != nil {
+		if cmd == "healthcheck" {
+			return 1 // Docker reserves exit code 2 for HEALTHCHECK
+		}
 		return 2
 	}
 
@@ -102,7 +109,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 func parseConfig(cmd string, args []string, stderr io.Writer) (config, error) {
 	var c config
-	var envErrs []error
+	var envErrs []envErr
 	fs := flag.NewFlagSet("echo-server "+cmd, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
@@ -117,37 +124,60 @@ func parseConfig(cmd string, args []string, stderr io.Writer) (config, error) {
 	} else {
 		fs.StringVar(&c.logFormat, "log-format", env("ECHO_LOG_FORMAT", "text"), "log format: text or json (env ECHO_LOG_FORMAT)")
 		fs.StringVar(&c.logLevel, "log-level", env("ECHO_LOG_LEVEL", "info"), "log level: debug, info, warn, error (env ECHO_LOG_LEVEL)")
-		fs.BoolVar(&c.accessLog, "access-log", envBool(&envErrs, "ECHO_ACCESS_LOG", true), "log every request (env ECHO_ACCESS_LOG)")
-		fs.Int64Var(&c.maxBody, "max-body", envInt(&envErrs, "ECHO_MAX_BODY", 1<<20), "max request body bytes to echo (env ECHO_MAX_BODY)")
-		fs.DurationVar(&c.maxDelay, "max-delay", envDuration(&envErrs, "ECHO_MAX_DELAY", 30*time.Second), "max delay a client may request (env ECHO_MAX_DELAY)")
-		fs.BoolVar(&c.enableEnv, "enable-env", envBool(&envErrs, "ECHO_ENABLE_ENV", false), "expose environment variables at /env (env ECHO_ENABLE_ENV)")
-		fs.DurationVar(&c.shutdownDelay, "shutdown-delay", envDuration(&envErrs, "ECHO_SHUTDOWN_DELAY", 0), "how long /readyz reports draining before shutdown (env ECHO_SHUTDOWN_DELAY)")
-		fs.DurationVar(&c.shutdownTimeout, "shutdown-timeout", envDuration(&envErrs, "ECHO_SHUTDOWN_TIMEOUT", 15*time.Second), "max time to wait for in-flight requests (env ECHO_SHUTDOWN_TIMEOUT)")
+		fs.BoolVar(&c.accessLog, "access-log", envBool(&envErrs, "access-log", "ECHO_ACCESS_LOG", true), "log every request (env ECHO_ACCESS_LOG)")
+		fs.Int64Var(&c.maxBody, "max-body", envInt(&envErrs, "max-body", "ECHO_MAX_BODY", 1<<20), "max request body bytes to echo (env ECHO_MAX_BODY)")
+		fs.DurationVar(&c.maxDelay, "max-delay", envDuration(&envErrs, "max-delay", "ECHO_MAX_DELAY", 30*time.Second), "max delay a client may request (env ECHO_MAX_DELAY)")
+		fs.BoolVar(&c.enableEnv, "enable-env", envBool(&envErrs, "enable-env", "ECHO_ENABLE_ENV", false), "expose environment variables at /env (env ECHO_ENABLE_ENV)")
+		fs.DurationVar(&c.shutdownDelay, "shutdown-delay", envDuration(&envErrs, "shutdown-delay", "ECHO_SHUTDOWN_DELAY", 0), "how long /readyz reports draining before shutdown (env ECHO_SHUTDOWN_DELAY)")
+		fs.DurationVar(&c.shutdownTimeout, "shutdown-timeout", envDuration(&envErrs, "shutdown-timeout", "ECHO_SHUTDOWN_TIMEOUT", 15*time.Second), "max time to wait for in-flight requests (env ECHO_SHUTDOWN_TIMEOUT)")
 	}
 
-	if err := errors.Join(envErrs...); err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
-		return c, err
-	}
 	if err := fs.Parse(args); err != nil {
 		return c, err
 	}
-	if fs.NArg() > 0 {
-		_, _ = fmt.Fprintf(stderr, "unexpected arguments: %v\n", fs.Args())
-		return c, errors.New("unexpected arguments")
+	fail := func(err error) (config, error) {
+		_, _ = fmt.Fprintf(stderr, "echo-server: %v\n", err)
+		return c, err
 	}
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "addr" {
-			c.addrSet = true
+	if fs.NArg() > 0 {
+		return fail(fmt.Errorf("unexpected arguments: %v", fs.Args()))
+	}
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	c.addrSet = set["addr"]
+
+	// A malformed environment variable is an error unless its flag overrides it.
+	var errs []error
+	for _, e := range envErrs {
+		if !set[e.flag] {
+			errs = append(errs, e.err)
 		}
-	})
-	if (c.tlsCert == "") != (c.tlsKey == "") {
-		_, _ = fmt.Fprintln(stderr, "both -tls-cert and -tls-key are required to enable TLS")
-		return c, errors.New("incomplete TLS config")
+	}
+	if cmd == "serve" {
+		if (c.tlsCert == "") != (c.tlsKey == "") {
+			errs = append(errs, errors.New("both -tls-cert and -tls-key are required to enable TLS"))
+		}
+		if c.maxBody <= 0 {
+			errs = append(errs, fmt.Errorf("-max-body must be positive, got %d", c.maxBody))
+		}
+		if c.maxDelay <= 0 {
+			errs = append(errs, fmt.Errorf("-max-delay must be positive, got %s", c.maxDelay))
+		}
+		if c.shutdownDelay < 0 {
+			errs = append(errs, fmt.Errorf("-shutdown-delay must not be negative, got %s", c.shutdownDelay))
+		}
+		if c.shutdownTimeout <= 0 {
+			errs = append(errs, fmt.Errorf("-shutdown-timeout must be positive, got %s", c.shutdownTimeout))
+		}
+		if _, err := newLogger(io.Discard, c.logFormat, c.logLevel); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if err := echo.ValidatePrefix(c.routePrefix); err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
-		return c, err
+		errs = append(errs, err)
+	}
+	if err := errors.Join(errs...); err != nil {
+		return fail(err)
 	}
 	return c, nil
 }
@@ -174,7 +204,7 @@ func serve(ctx context.Context, cfg config, stderr io.Writer) error {
 		Handler:           h,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       time.Minute,
-		WriteTimeout:      time.Minute,
+		WriteTimeout:      max(time.Minute, cfg.maxDelay+30*time.Second), // never cut a requested delay short
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
@@ -208,12 +238,23 @@ func serve(ctx context.Context, cfg config, stderr io.Writer) error {
 		return err
 	}
 
-	healthURL := scheme + "://" + probeHost(ln.Addr()) + h.HealthPath()
+	st := state{URL: scheme + "://" + probeHost(ln.Addr()) + h.HealthPath()}
+	if cfg.tlsCert != "" {
+		st.TLSCert, _ = filepath.Abs(cfg.tlsCert)
+	}
 	if cfg.stateFile != "" {
-		if err := os.WriteFile(cfg.stateFile, []byte(healthURL+"\n"), 0o644); err != nil {
-			logger.Debug("could not write state file", "path", cfg.stateFile, "err", err)
+		b, _ := json.Marshal(st)
+		b = append(b, '\n')
+		if err := os.WriteFile(cfg.stateFile, b, 0o644); err != nil {
+			logger.Warn("could not write state file; the healthcheck command will fall back to -addr and the environment",
+				"path", cfg.stateFile, "err", err)
 		} else {
-			defer func() { _ = os.Remove(cfg.stateFile) }()
+			defer func() {
+				// Another instance may have taken the file over since; leave theirs alone.
+				if cur, err := os.ReadFile(cfg.stateFile); err == nil && bytes.Equal(cur, b) {
+					_ = os.Remove(cfg.stateFile)
+				}
+			}()
 		}
 	}
 
@@ -261,47 +302,106 @@ func probeHost(addr net.Addr) string {
 	return net.JoinHostPort(host, port)
 }
 
+// state is what serve records for the healthcheck command, so the probe
+// matches how the server was actually started (address, prefix, TLS).
+type state struct {
+	URL     string `json:"url"`
+	TLSCert string `json:"tls_cert,omitempty"`
+}
+
 // healthcheck probes the local server's liveness endpoint. It lets distroless
 // images, which have no curl or wget, define a Docker HEALTHCHECK.
 //
 // The URL comes from, in order: -url; -addr (with -tls-cert and
-// -route-prefix); the state file the running server wrote, which reflects the
-// flags it was actually started with; then the environment and defaults.
+// -route-prefix); the state file the running server wrote; then the
+// environment and defaults. For HTTPS, the server must present the
+// certificate it was configured with: the probe pins it rather than skipping
+// verification.
 func healthcheck(cfg config) error {
-	url := cfg.url
-	if url == "" && !cfg.addrSet {
+	st := state{URL: cfg.url, TLSCert: cfg.tlsCert}
+	if st.URL == "" && !cfg.addrSet {
 		if b, err := os.ReadFile(cfg.stateFile); err == nil {
-			url = strings.TrimSpace(string(b))
+			var saved state
+			if err := json.Unmarshal(b, &saved); err != nil {
+				return fmt.Errorf("reading state file %s: %w", cfg.stateFile, err)
+			}
+			st = saved
 		}
 	}
-	if url == "" {
-		_, port, err := net.SplitHostPort(cfg.addr)
+	if st.URL == "" {
+		host, port, err := net.SplitHostPort(cfg.addr)
 		if err != nil {
-			return err
+			return fmt.Errorf("invalid address %q: %w", cfg.addr, err)
+		}
+		if ip := net.ParseIP(host); host == "" || (ip != nil && ip.IsUnspecified()) {
+			host = "127.0.0.1"
 		}
 		scheme := "http"
 		if cfg.tlsCert != "" {
 			scheme = "https"
 		}
-		url = scheme + "://" + net.JoinHostPort("127.0.0.1", port) + strings.TrimSuffix(cfg.routePrefix, "/") + "/healthz"
+		st.URL = scheme + "://" + net.JoinHostPort(host, port) + strings.TrimSuffix(cfg.routePrefix, "/") + "/healthz"
 	}
 
-	client := &http.Client{
-		Timeout: 3 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // probing our own local server
-		},
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil // never route a local probe through HTTP(S)_PROXY
+	if strings.HasPrefix(st.URL, "https://") && st.TLSCert != "" {
+		tlsConfig, err := pinnedTLSConfig(st.TLSCert)
+		if err != nil {
+			return err
+		}
+		transport.TLSClientConfig = tlsConfig
 	}
-	resp, err := client.Get(url)
+	client := &http.Client{Timeout: 3 * time.Second, Transport: transport}
+
+	resp, err := client.Get(st.URL)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s returned %d", url, resp.StatusCode)
+		return fmt.Errorf("%s returned %d", st.URL, resp.StatusCode)
 	}
 	return nil
+}
+
+// pinnedTLSConfig trusts exactly the certificates in certFile, and checks
+// the server's name against the leaf's first DNS or IP SAN, since the probe
+// dials a loopback address the certificate usually doesn't name.
+func pinnedTLSConfig(certFile string) (*tls.Config, error) {
+	data, err := os.ReadFile(certFile)
+	if err != nil {
+		return nil, fmt.Errorf("reading TLS certificate: %w", err)
+	}
+	pool := x509.NewCertPool()
+	var leaf *x509.Certificate
+	for block, rest := pem.Decode(data); block != nil; block, rest = pem.Decode(rest) {
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		c, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("parsing TLS certificate %s: %w", certFile, err)
+		}
+		if leaf == nil {
+			leaf = c
+		}
+		pool.AddCert(c)
+	}
+	if leaf == nil {
+		return nil, fmt.Errorf("no certificate found in %s", certFile)
+	}
+	name := ""
+	switch {
+	case len(leaf.DNSNames) > 0:
+		name = leaf.DNSNames[0]
+	case len(leaf.IPAddresses) > 0:
+		name = leaf.IPAddresses[0].String()
+	default:
+		return nil, fmt.Errorf("certificate %s has no DNS or IP subject alternative names to verify", certFile)
+	}
+	return &tls.Config{RootCAs: pool, ServerName: name, MinVersion: tls.VersionTLS12}, nil
 }
 
 func newLogger(w io.Writer, format, level string) (*slog.Logger, error) {
@@ -337,29 +437,36 @@ func env(key, fallback string) string {
 	return fallback
 }
 
+// envErr is a malformed environment variable, tied to the flag that can
+// override it.
+type envErr struct {
+	flag string
+	err  error
+}
+
 // The env* helpers fall back when a variable is unset, and record an error
 // when it is set to something unparseable rather than silently ignoring it.
 
-func envBool(errs *[]error, key string, fallback bool) bool {
-	return envParse(errs, key, fallback, strconv.ParseBool)
+func envBool(errs *[]envErr, flag, key string, fallback bool) bool {
+	return envParse(errs, flag, key, fallback, strconv.ParseBool)
 }
 
-func envInt(errs *[]error, key string, fallback int64) int64 {
-	return envParse(errs, key, fallback, func(s string) (int64, error) { return strconv.ParseInt(s, 10, 64) })
+func envInt(errs *[]envErr, flag, key string, fallback int64) int64 {
+	return envParse(errs, flag, key, fallback, func(s string) (int64, error) { return strconv.ParseInt(s, 10, 64) })
 }
 
-func envDuration(errs *[]error, key string, fallback time.Duration) time.Duration {
-	return envParse(errs, key, fallback, time.ParseDuration)
+func envDuration(errs *[]envErr, flag, key string, fallback time.Duration) time.Duration {
+	return envParse(errs, flag, key, fallback, time.ParseDuration)
 }
 
-func envParse[T any](errs *[]error, key string, fallback T, parse func(string) (T, error)) T {
+func envParse[T any](errs *[]envErr, flag, key string, fallback T, parse func(string) (T, error)) T {
 	s, ok := os.LookupEnv(key)
 	if !ok || s == "" {
 		return fallback
 	}
 	v, err := parse(s)
 	if err != nil {
-		*errs = append(*errs, fmt.Errorf("invalid %s=%q", key, s))
+		*errs = append(*errs, envErr{flag: flag, err: fmt.Errorf("invalid %s=%q", key, s)})
 		return fallback
 	}
 	return v

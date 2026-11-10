@@ -1,9 +1,11 @@
 package echo
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -20,13 +22,28 @@ type controls struct {
 	format  string
 }
 
+// queryForbiddenHeaders can be set with the X-Echo-Header request header but
+// not with the echo_header query parameter. A query parameter rides along on
+// a plain link, so allowing these would turn the server into an open
+// redirect and a way to plant cookies on whatever domain hosts it. The
+// header form needs a script (and a CORS preflight) to send cross-site.
+var queryForbiddenHeaders = map[string]bool{
+	"Location":        true,
+	"Refresh":         true,
+	"Set-Cookie":      true,
+	"Clear-Site-Data": true,
+}
+
 func (h *Handler) parseControls(r *http.Request) (controls, error) {
-	q := r.URL.Query()
+	q := parseQuery(r.URL.RawQuery)
 	get := func(name string) string {
 		if v := r.Header.Get("X-Echo-" + name); v != "" {
 			return v
 		}
-		return q.Get("echo_" + strings.ToLower(name))
+		if vs := q["echo_"+strings.ToLower(name)]; len(vs) > 0 {
+			return vs[0]
+		}
+		return ""
 	}
 
 	var c controls
@@ -38,19 +55,33 @@ func (h *Handler) parseControls(r *http.Request) (controls, error) {
 		c.status = code
 	}
 	if s := get("Delay"); s != "" {
-		d, err := h.parseDelay(s)
+		d, err := parseDuration("delay", s, 0, h.opts.MaxDelay)
 		if err != nil {
 			return c, err
 		}
 		c.delay = d
 	}
-	for _, v := range append(r.Header.Values("X-Echo-Header"), q["echo_header"]...) {
+	addHeader := func(v string, fromQuery bool) error {
 		name, value, ok := strings.Cut(v, ":")
-		name = strings.TrimSpace(name)
+		name = http.CanonicalHeaderKey(strings.TrimSpace(name))
 		if !ok || name == "" {
-			return c, fmt.Errorf("invalid echo header %q: want \"Name: value\"", v)
+			return fmt.Errorf("invalid echo header %q: want \"Name: value\"", v)
 		}
-		c.headers = append(c.headers, [2]string{http.CanonicalHeaderKey(name), strings.TrimSpace(value)})
+		if fromQuery && queryForbiddenHeaders[name] {
+			return fmt.Errorf("echo header %s can't be set with the echo_header query parameter; use the X-Echo-Header request header", name)
+		}
+		c.headers = append(c.headers, [2]string{name, strings.TrimSpace(value)})
+		return nil
+	}
+	for _, v := range r.Header.Values("X-Echo-Header") {
+		if err := addHeader(v, false); err != nil {
+			return c, err
+		}
+	}
+	for _, v := range q["echo_header"] {
+		if err := addHeader(v, true); err != nil {
+			return c, err
+		}
 	}
 	c.format = strings.ToLower(get("Format"))
 	switch c.format {
@@ -69,22 +100,29 @@ func parseStatus(s string) (int, error) {
 	return code, nil
 }
 
-// parseDelay accepts Go durations ("250ms", "1.5s") or bare milliseconds ("250").
-func (h *Handler) parseDelay(s string) (time.Duration, error) {
+// parseDuration accepts Go durations ("250ms", "1.5s") or bare milliseconds
+// ("250"), and requires lo <= d <= hi. name is used in error messages.
+func parseDuration(name, s string, lo, hi time.Duration) (time.Duration, error) {
 	s = strings.TrimSpace(s)
 	d, err := time.ParseDuration(s)
 	if err != nil {
 		ms, msErr := strconv.ParseFloat(s, 64)
-		if msErr != nil {
-			return 0, fmt.Errorf("invalid delay %q: want a duration like 250ms or 2s", s)
+		if msErr != nil || math.IsNaN(ms) || math.IsInf(ms, 0) {
+			return 0, fmt.Errorf("invalid %s %q: want a duration like 250ms or 2s", name, s)
+		}
+		// Compare in float before converting, so huge values can't overflow.
+		if ms*float64(time.Millisecond) > float64(hi) {
+			return 0, fmt.Errorf("%s %q exceeds the maximum of %s", name, s, hi)
 		}
 		d = time.Duration(ms * float64(time.Millisecond))
 	}
-	if d < 0 {
-		return 0, fmt.Errorf("invalid delay %q: must not be negative", s)
-	}
-	if d > h.opts.MaxDelay {
-		return 0, fmt.Errorf("delay %s exceeds the maximum of %s", d, h.opts.MaxDelay)
+	switch {
+	case d < 0:
+		return 0, fmt.Errorf("invalid %s %q: must not be negative", name, s)
+	case d < lo:
+		return 0, fmt.Errorf("%s %s is below the minimum of %s", name, d, lo)
+	case d > hi:
+		return 0, fmt.Errorf("%s %s exceeds the maximum of %s", name, d, hi)
 	}
 	return d, nil
 }
@@ -98,6 +136,7 @@ func (h *Handler) handleEcho(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
+	setCORS(w, r)
 	code, err := parseStatus(r.PathValue("code"))
 	if err != nil {
 		httpError(w, http.StatusBadRequest, err)
@@ -107,7 +146,8 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleDelay(w http.ResponseWriter, r *http.Request) {
-	d, err := h.parseDelay(r.PathValue("duration"))
+	setCORS(w, r)
+	d, err := parseDuration("delay", r.PathValue("duration"), 0, h.opts.MaxDelay)
 	if err != nil {
 		httpError(w, http.StatusBadRequest, err)
 		return
@@ -117,6 +157,12 @@ func (h *Handler) handleDelay(w http.ResponseWriter, r *http.Request) {
 
 // respond applies controls from the request on top of base, then echoes.
 func (h *Handler) respond(w http.ResponseWriter, r *http.Request, base controls) {
+	setCORS(w, r)
+	if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	c, err := h.parseControls(r)
 	if err != nil {
 		httpError(w, http.StatusBadRequest, err)
@@ -129,12 +175,6 @@ func (h *Handler) respond(w http.ResponseWriter, r *http.Request, base controls)
 		c.delay = base.delay
 	}
 
-	setCORS(w, r)
-	if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
 	e, raw, err := h.capture(w, r)
 	if err != nil {
 		httpError(w, http.StatusBadRequest, fmt.Errorf("reading body: %w", err))
@@ -142,19 +182,9 @@ func (h *Handler) respond(w http.ResponseWriter, r *http.Request, base controls)
 	}
 
 	if c.delay > 0 {
-		// Keep the server's write timeout from cutting the delay short.
-		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(c.delay + 30*time.Second))
 		if err := h.sleep(r.Context(), c.delay); err != nil {
-			return // client went away
+			return // client went away; recorded as 499
 		}
-	}
-
-	for _, kv := range c.headers {
-		w.Header().Add(kv[0], kv[1])
-	}
-	status := c.status
-	if status == 0 {
-		status = http.StatusOK
 	}
 
 	format := c.format
@@ -162,36 +192,54 @@ func (h *Handler) respond(w http.ResponseWriter, r *http.Request, base controls)
 		format = negotiate(r)
 	}
 
+	// Render first so HEAD and bodyless statuses get the same headers a GET would.
+	var body []byte
+	switch format {
+	case "raw":
+		if ct := r.Header.Get("Content-Type"); ct != "" {
+			w.Header().Set("Content-Type", ct)
+		}
+		body = raw
+	case "text":
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		body = []byte(rawRequest(r, raw, e.Body != nil && e.Body.Truncated))
+	case "html":
+		body = h.renderHTML(w.Header(), e)
+	default:
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		body = marshalJSON(e)
+	}
+
 	// The echoed content is attacker-controllable (query values, bodies,
 	// even Content-Type via echo_header), so never let a browser execute it
 	// with this origin's privileges. The HTML view sets its own stricter CSP.
 	if format != "html" {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Add("Content-Security-Policy", "sandbox")
+		w.Header().Set("Content-Security-Policy", "sandbox")
 	}
-
-	// Some responses must not carry a body.
-	if r.Method == http.MethodHead || status == http.StatusNoContent || status == http.StatusNotModified {
-		w.WriteHeader(status)
-		return
-	}
-
-	switch format {
-	case "raw":
-		if ct := r.Header.Get("Content-Type"); ct != "" && w.Header().Get("Content-Type") == "" {
-			w.Header().Set("Content-Type", ct)
+	// Requested headers go last so they can override the defaults above;
+	// a requested Content-Security-Policy adds to the sandbox, never replaces it.
+	for _, kv := range c.headers {
+		switch kv[0] {
+		case "Content-Type":
+			w.Header().Set(kv[0], kv[1])
+		default:
+			w.Header().Add(kv[0], kv[1])
 		}
-		w.WriteHeader(status)
-		_, _ = w.Write(raw)
-	case "text":
-		setDefault(w, "Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(status)
-		_, _ = w.Write([]byte(rawRequest(r, raw, e.Body != nil && e.Body.Truncated)))
-	case "html":
-		h.renderHTML(w, status, e)
-	default:
-		writeJSON(w, status, e)
 	}
+
+	status := c.status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	if r.Method != http.MethodHead && bodyAllowed(status) {
+		_, _ = w.Write(body)
+	}
+}
+
+func bodyAllowed(status int) bool {
+	return status != http.StatusNoContent && status != http.StatusNotModified
 }
 
 // negotiate picks a format from the Accept header: browsers get HTML, plain
@@ -252,25 +300,27 @@ func (h *Handler) handleEnv(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, env)
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	setDefault(w, "Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	enc := json.NewEncoder(w)
+func marshalJSON(v any) []byte {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
 	enc.SetIndent("", "  ")
 	enc.SetEscapeHTML(false)
 	_ = enc.Encode(v)
+	return buf.Bytes()
 }
 
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = w.Write(marshalJSON(v))
+}
+
+// httpError writes a JSON error. Errors can quote request input, so they get
+// the same sandboxing as echoed content.
 func httpError(w http.ResponseWriter, status int, err error) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "sandbox")
 	writeJSON(w, status, map[string]string{"error": err.Error()})
-}
-
-func setDefault(w http.ResponseWriter, key, value string) {
-	if w.Header().Get(key) == "" {
-		w.Header().Set(key, value)
-	}
 }
 
 // sleep waits for d, returning early with an error if the client goes away.

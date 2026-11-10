@@ -13,7 +13,7 @@ instance answered.
 - **Any path, any method.** JSON for clients, a readable page for browsers, the raw HTTP wire format on request.
 - **Shape the response.** Set the status, delay and response headers from the request itself.
 - **WebSockets and SSE.** Upgrade any path to a WebSocket echo, or stream server-sent events.
-- **HTTP/2 everywhere.** h2 over TLS and h2c over plaintext on the same port; mTLS client certs are shown.
+- **HTTP/2 everywhere.** h2 over TLS and h2c (prior knowledge) over plaintext on the same port; mTLS client certs are shown.
 - **Built for clusters.** Liveness and readiness probes, graceful draining that closes streams, Prometheus metrics, JSON logs.
 - **Small and static.** One Go binary on a distroless, nonroot image with a built-in healthcheck, for amd64, arm64 and arm/v7.
 
@@ -43,6 +43,7 @@ curl 'localhost:8080/hello?name=gopher' -H 'Content-Type: application/json' -d '
     "Content-Type": ["application/json"],
     "User-Agent": ["curl/8.14.1"]
   },
+  "content_length": 11,
   "body": {
     "content_type": "application/json",
     "size": 11,
@@ -50,9 +51,9 @@ curl 'localhost:8080/hello?name=gopher' -H 'Content-Type: application/json' -d '
     "data": "{\"hi\":true}",
     "json": { "hi": true }
   },
-  "server": { "hostname": "echo-7d9f4c", "version": "v2.0.0" },
-  "request_id": "26f307f79679cf4f",
-  "time": "2026-11-10T08:05:22.220735753Z"
+  "server": { "hostname": "echo-7d9f4c", "version": "v1.0.0" },
+  "request_id": "cda1afb896db4a7d",
+  "time": "2026-11-10T08:56:05.391620915Z"
 }
 ```
 
@@ -63,15 +64,19 @@ Prefer a binary? Download one for Linux, macOS, Windows or FreeBSD from
 [Releases](https://github.com/syntaqx/echo-server/releases), or
 `go install github.com/syntaqx/echo-server/cmd/echo-server@latest`.
 
+Image tags: `latest` and `1`, `1.0`, `1.0.0` follow releases; `main` and
+`nightly` track the default branch.
+
 ## Shaping the response
 
-These work on **every echoed path**, as a request header or a query parameter:
+These work on every echoed path and on `/status` and `/delay`, as a request
+header or a query parameter:
 
 | Header          | Query parameter | Effect                                                          |
 | --------------- | --------------- | --------------------------------------------------------------- |
 | `X-Echo-Status` | `echo_status`   | Respond with this status code (200–599).                        |
 | `X-Echo-Delay`  | `echo_delay`    | Wait before responding: `250ms`, `2s`, or bare milliseconds.    |
-| `X-Echo-Header` | `echo_header`   | Add a response header, `Name: value`. Repeatable.               |
+| `X-Echo-Header` | `echo_header`   | Add a response header, `Name: value`. Repeatable.\*             |
 | `X-Echo-Format` | `echo_format`   | `json`, `html`, `text` (HTTP wire format) or `raw` (body only). |
 
 ```sh
@@ -88,11 +93,18 @@ curl 'localhost:8080/anything?echo_format=text'
 curl 'localhost:8080/?echo_format=raw' -H 'Content-Type: text/csv' --data-binary @data.csv
 ```
 
+\* `Location`, `Refresh`, `Set-Cookie` and `Clear-Site-Data` can only be set
+with the `X-Echo-Header` request header, not the query parameter: a query
+parameter works from a plain link, which would make any echo-server an open
+redirect and a cookie-planting tool for its domain.
+
 Without a format, browsers (`Accept: text/html`) get HTML, `Accept: text/plain`
 gets text and everything else gets JSON. Bodies are parsed for JSON,
 URL-encoded forms and multipart uploads (files are summarized, not dumped).
-Binary bodies are base64-encoded, and bodies over `-max-body` are truncated and
-marked as such.
+Binary bodies are base64-encoded. Bodies over `-max-body` are truncated in the
+echo, but `size` is always the full size. Chunked requests show
+`transfer_encoding` and any trailers; paths are echoed exactly as sent,
+including `//`, `.` and `..` segments.
 
 Every response carries `X-Echo-Server` (the hostname, handy behind a load
 balancer) and `X-Request-Id` (yours if you sent one).
@@ -101,18 +113,19 @@ balancer) and `X-Request-Id` (yours if you sent one).
 
 | Route                | Description                                                          |
 | -------------------- | -------------------------------------------------------------------- |
-| `/*`                 | Echo the request. A WebSocket upgrade on any path echoes messages.   |
+| `/*`                 | Echo the request. A WebSocket upgrade echoes messages back.          |
 | `/status/{code}`     | Echo with the given status code.                                     |
 | `/delay/{duration}`  | Echo after a delay.                                                  |
-| `/sse`               | Server-sent events. `?interval=500ms&count=10` (count 0 = forever).  |
+| `/sse`               | Server-sent events. `?interval=500ms&count=10`. Interval 10ms–1h.    |
 | `/healthz`, `/livez` | Liveness probe.                                                      |
 | `/readyz`            | Readiness probe. Returns 503 once shutdown begins.                   |
 | `/metrics`           | Prometheus metrics: requests, latency, in-flight, WebSockets.        |
 | `/env`               | Environment variables. **Off unless `-enable-env` is set.**          |
 
 ```sh
-websocat ws://localhost:8080/ws
+websocat ws://localhost:8080/ws                  # any echoed path upgrades
 curl -N 'localhost:8080/sse?interval=500ms&count=5'
+curl --http2-prior-knowledge localhost:8080/     # h2c; plain --http2 stays on HTTP/1.1
 ```
 
 **Need to echo `/healthz` or `/metrics` themselves?** Proxying a real app's
@@ -127,8 +140,9 @@ curl localhost:8080/_echo/healthz    # liveness probe
 
 ## Configuration
 
-Every flag has an environment variable; flags take precedence. Invalid values
-are rejected at startup rather than silently ignored.
+Every flag has an environment variable; flags take precedence. Invalid values,
+including malformed environment variables that no flag overrides, are rejected
+at startup (exit code 2) rather than silently ignored.
 
 | Flag                | Environment             | Default   | Description                                                 |
 | ------------------- | ----------------------- | --------- | ----------------------------------------------------------- |
@@ -152,7 +166,9 @@ are rejected at startup rather than silently ignored.
 `HEALTHCHECK` uses it, so no curl or shell is needed. It finds the running
 server through the state file, so it keeps working however the server was
 started, including with flags like `-addr :9000 -route-prefix /_echo` or TLS.
-Pass `-url` to probe something specific.
+Pass `-url` to probe something specific. For HTTPS it verifies the server's
+certificate against the configured `-tls-cert` rather than skipping
+verification. Every failure exits 1, since Docker reserves 2.
 
 ### Shutdown
 
@@ -182,7 +198,8 @@ containers:
 
 ## As a Go library
 
-The handler can be mounted in any server, including test servers:
+The handler can be mounted in any server, including test servers. The API
+follows semantic versioning from v1.0.0.
 
 ```go
 import echo "github.com/syntaqx/echo-server"
@@ -193,7 +210,8 @@ defer srv.Close()
 ```
 
 If you run it in your own `http.Server`, call `srv.RegisterOnShutdown(h.CloseStreams)`
-so `Shutdown` doesn't wait on open WebSockets and SSE streams.
+so `Shutdown` doesn't wait on open WebSockets and SSE streams, and keep any
+`WriteTimeout` above `Options.MaxDelay`.
 
 ## Security
 
@@ -205,6 +223,9 @@ An echo server reflects whatever it's sent, cookies included, so:
 - **Cross-origin reads never include credentials.** CORS allows any origin but
   never sets `Access-Control-Allow-Credentials`, so other sites can't use a
   visitor's cookies to read their echo.
+- **Links can't redirect or set cookies.** The query-parameter form of
+  `echo_header` refuses `Location`, `Refresh`, `Set-Cookie` and
+  `Clear-Site-Data`.
 - **Echoed content can't run as this site.** Responses other than the HTML view
   are sent with `Content-Security-Policy: sandbox` and `nosniff`, even if a
   client sets `Content-Type: text/html`. The HTML view has a strict nonce-based

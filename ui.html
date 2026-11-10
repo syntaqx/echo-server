@@ -109,6 +109,8 @@ footer { margin-top: 32px; color: var(--muted); font-size: 13px; text-align: cen
           <tr><td class="k">remote addr</td><td class="v">{{.RemoteAddr}}</td></tr>
           <tr><td class="k">protocol</td><td class="v">{{.Proto}}</td></tr>
           <tr><td class="k">url</td><td class="v">{{.URL}}</td></tr>
+          {{if ge .ContentLength 0}}<tr><td class="k">content length</td><td class="v">{{.ContentLength}}</td></tr>{{end}}
+          {{if .TransferEncoding}}<tr><td class="k">transfer encoding</td><td class="v">{{join .TransferEncoding ", "}}</td></tr>{{end}}
         </table>
       </div>
       <div class="card">
@@ -140,7 +142,7 @@ footer { margin-top: 32px; color: var(--muted); font-size: 13px; text-align: cen
     {{if .Cookies}}
     <div class="card">
       <h2>Cookies <span class="count">{{len .Cookies}}</span></h2>
-      <table>{{range $k, $v := .Cookies}}<tr><td class="k">{{$k}}</td><td class="v">{{$v}}</td></tr>{{end}}</table>
+      <table>{{range .Cookies}}<tr><td class="k">{{.Name}}</td><td class="v">{{.Value}}</td></tr>{{end}}</table>
     </div>
     {{end}}
 
@@ -150,6 +152,13 @@ footer { margin-top: 32px; color: var(--muted); font-size: 13px; text-align: cen
       {{if .ContentType}}<div class="empty"><span class="pill">{{.ContentType}}</span> <span class="pill">{{.Encoding}}</span></div>{{end}}
       {{if .Files}}<table>{{range .Files}}<tr><td class="k">{{.Field}}</td><td class="v">{{.Filename}} · {{.ContentType}} · {{.Size}} bytes</td></tr>{{end}}</table>{{end}}
       {{if .Data}}<pre>{{.Data}}</pre>{{end}}
+    </div>
+    {{end}}
+
+    {{if .Trailers}}
+    <div class="card">
+      <h2>Trailers <span class="count">{{len .Trailers}}</span></h2>
+      <table>{{range $k := sorted .Trailers}}<tr><td class="k">{{$k}}</td><td class="v">{{join (index $.Trailers $k) ", "}}</td></tr>{{end}}</table>
     </div>
     {{end}}
   </section>

@@ -3,6 +3,7 @@ package echo
 import (
 	"cmp"
 	"fmt"
+	"maps"
 	"net/http"
 	"runtime"
 	"slices"
@@ -100,12 +101,7 @@ func (h *Handler) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 }
 
 func sortedKeys2(m map[[2]string]uint64) [][2]string {
-	keys := make([][2]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	slices.SortFunc(keys, func(a, b [2]string) int {
+	return slices.SortedFunc(maps.Keys(m), func(a, b [2]string) int {
 		return cmp.Or(strings.Compare(a[0], b[0]), strings.Compare(a[1], b[1]))
 	})
-	return keys
 }

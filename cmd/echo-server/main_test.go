@@ -6,13 +6,15 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"io"
+	"log"
 	"math/big"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,7 +31,7 @@ func runCmd(t *testing.T, ctx context.Context, args ...string) (int, string) {
 }
 
 func TestCommandErrors(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	tests := []struct {
 		name string
 		env  map[string]string
@@ -45,8 +47,14 @@ func TestCommandErrors(t *testing.T) {
 		{name: "half TLS", args: []string{"-tls-cert", "x.pem"}, code: 2, out: "both -tls-cert and -tls-key"},
 		{name: "bad prefix", args: []string{"-route-prefix", "nope"}, code: 2, out: "invalid route prefix"},
 		{name: "bad env", env: map[string]string{"ECHO_MAX_DELAY": "soon"}, code: 2, out: `invalid ECHO_MAX_DELAY="soon"`},
-		{name: "bad log format", args: []string{"-addr", "127.0.0.1:0", "-log-format", "xml"}, code: 1, out: "invalid log format"},
-		{name: "bad log level", args: []string{"-addr", "127.0.0.1:0", "-log-level", "loud"}, code: 1, out: "invalid log level"},
+		{name: "bad log format", args: []string{"-log-format", "xml"}, code: 2, out: "invalid log format"},
+		{name: "bad log level", args: []string{"-log-level", "loud"}, code: 2, out: "invalid log level"},
+		{name: "zero max delay", args: []string{"-max-delay", "0"}, code: 2, out: "-max-delay must be positive"},
+		{name: "negative max body", args: []string{"-max-body", "-5"}, code: 2, out: "-max-body must be positive"},
+		{name: "zero shutdown timeout", args: []string{"-shutdown-timeout", "0s"}, code: 2, out: "-shutdown-timeout must be positive"},
+		{name: "unclean prefix", args: []string{"-route-prefix", "/.."}, code: 2, out: "must be a clean path"},
+		{name: "errors are reported together", args: []string{"-max-delay", "0", "-max-body", "0"}, code: 2, out: "-max-body must be positive"},
+		{name: "healthcheck bad flag exits 1, not Docker's reserved 2", args: []string{"healthcheck", "-nope"}, code: 1},
 		{name: "missing TLS files", args: []string{"-addr", "127.0.0.1:0", "-tls-cert", "nope.pem", "-tls-key", "nope.key"}, code: 1, out: "loading TLS key pair"},
 	}
 	for _, tt := range tests {
@@ -68,7 +76,7 @@ func TestCommandErrors(t *testing.T) {
 func TestVersion(t *testing.T) {
 	version = "v9.9.9"
 	t.Cleanup(func() { version = "" })
-	if code, out := runCmd(t, context.Background(), "version"); code != 0 || strings.TrimSpace(out) != "v9.9.9" {
+	if code, out := runCmd(t, t.Context(), "version"); code != 0 || strings.TrimSpace(out) != "v9.9.9" {
 		t.Errorf("version = %d %q", code, out)
 	}
 }
@@ -92,7 +100,7 @@ func TestEnvOverridesAndFlagsWin(t *testing.T) {
 
 func TestHealthcheckFailsWithoutServer(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "state")
-	code, out := runCmd(t, context.Background(), "healthcheck", "-state-file", state, "-addr", "127.0.0.1:1")
+	code, out := runCmd(t, t.Context(), "healthcheck", "-state-file", state, "-addr", "127.0.0.1:1")
 	if code != 1 || !strings.Contains(out, "unhealthy") {
 		t.Errorf("healthcheck = %d %q", code, out)
 	}
@@ -115,27 +123,42 @@ func testLifecycle(t *testing.T, useTLS bool) {
 		args = append(args, "-tls-cert", cert, "-tls-key", key)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	done := make(chan int, 1)
 	var logs safeBuffer
 	go func() { done <- run(ctx, args, &logs, &logs) }()
 
-	healthURL := waitForFile(t, state)
+	st := waitForState(t, state)
+	healthURL := st.URL
 	wantScheme := map[bool]string{false: "http://", true: "https://"}[useTLS]
 	if !strings.HasPrefix(healthURL, wantScheme+"127.0.0.1:") || !strings.HasSuffix(healthURL, "/_echo/healthz") {
-		t.Fatalf("state file = %q", healthURL)
+		t.Fatalf("state file = %+v", st)
+	}
+	if useTLS != (st.TLSCert != "") || (useTLS && !filepath.IsAbs(st.TLSCert)) {
+		t.Fatalf("state file cert = %q", st.TLSCert)
 	}
 
 	// No -addr: the healthcheck must discover the server from the state file.
-	if code, out := runCmd(t, context.Background(), "healthcheck", "-state-file", state); code != 0 {
+	if code, out := runCmd(t, t.Context(), "healthcheck", "-state-file", state); code != 0 {
 		t.Fatalf("healthcheck = %d %s", code, out)
 	}
-	if code, out := runCmd(t, context.Background(), "healthcheck", "-url", healthURL); code != 0 {
+	urlArgs := []string{"healthcheck", "-url", healthURL}
+	if useTLS {
+		urlArgs = append(urlArgs, "-tls-cert", st.TLSCert)
+	}
+	if code, out := runCmd(t, t.Context(), urlArgs...); code != 0 {
 		t.Fatalf("healthcheck -url = %d %s", code, out)
 	}
 
-	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}} //nolint:gosec // test server
+	client := http.DefaultClient
+	if useTLS {
+		tlsConfig, err := pinnedTLSConfig(st.TLSCert)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client = &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig}}
+	}
 	base := strings.TrimSuffix(healthURL, "/_echo/healthz")
 	sse, err := client.Get(base + "/_echo/sse")
 	if err != nil {
@@ -166,17 +189,47 @@ func testLifecycle(t *testing.T, useTLS bool) {
 	}
 }
 
-func waitForFile(t *testing.T, path string) string {
+func waitForState(t *testing.T, path string) state {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if b, err := os.ReadFile(path); err == nil && len(b) > 0 {
-			return strings.TrimSpace(string(b))
+		var st state
+		if b, err := os.ReadFile(path); err == nil && json.Unmarshal(b, &st) == nil && st.URL != "" {
+			return st
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("server never wrote %s", path)
-	return ""
+	return state{}
+}
+
+// The TLS probe pins the configured certificate: a server presenting any
+// other certificate is unhealthy, even on loopback.
+func TestHealthcheckPinsCertificate(t *testing.T) {
+	cert, _ := writeSelfSigned(t, t.TempDir())
+	other := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	other.Config.ErrorLog = log.New(io.Discard, "", 0) // the rejected handshake is the point
+	other.StartTLS()
+	defer other.Close()
+
+	code, out := runCmd(t, t.Context(), "healthcheck", "-url", other.URL+"/healthz", "-tls-cert", cert)
+	if code != 1 || !strings.Contains(out, "certificate") {
+		t.Errorf("healthcheck against a different cert = %d %q, want a certificate error", code, out)
+	}
+}
+
+func TestPinnedTLSConfigErrors(t *testing.T) {
+	dir := t.TempDir()
+	noCert := filepath.Join(dir, "empty.pem")
+	_ = os.WriteFile(noCert, []byte("not a pem"), 0o600)
+	for path, want := range map[string]string{
+		filepath.Join(dir, "missing.pem"): "reading TLS certificate",
+		noCert:                            "no certificate found",
+	} {
+		if _, err := pinnedTLSConfig(path); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("pinnedTLSConfig(%s) = %v, want %q", filepath.Base(path), err, want)
+		}
+	}
 }
 
 func writeSelfSigned(t *testing.T, dir string) (certPath, keyPath string) {
@@ -226,4 +279,53 @@ func (b *safeBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// A second instance can take over the shared default state file; the first
+// one exiting must not delete it.
+func TestStateFileNotRemovedIfTakenOver(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "state")
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, []string{"-addr", "127.0.0.1:0", "-state-file", state}, io.Discard, io.Discard)
+	}()
+	waitForState(t, state)
+
+	takeover := []byte(`{"url":"http://127.0.0.1:1/healthz"}` + "\n")
+	if err := os.WriteFile(state, takeover, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if code := <-done; code != 0 {
+		t.Fatalf("serve exited %d", code)
+	}
+	if got, err := os.ReadFile(state); err != nil || !bytes.Equal(got, takeover) {
+		t.Errorf("state file = %q, %v; want the other instance's", got, err)
+	}
+}
+
+func TestHealthcheckProbesSpecificAddr(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/healthz" {
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+	missing := filepath.Join(t.TempDir(), "none")
+	if code, out := runCmd(t, t.Context(), "healthcheck", "-addr", addr, "-state-file", missing); code != 0 {
+		t.Errorf("healthcheck -addr %s = %d %s", addr, code, out)
+	}
+}
+
+func TestFlagOverridesMalformedEnv(t *testing.T) {
+	t.Setenv("ECHO_MAX_DELAY", "soon")
+	cfg, err := parseConfig("serve", []string{"-max-delay", "2s"}, io.Discard)
+	if err != nil || cfg.maxDelay != 2*time.Second {
+		t.Errorf("flag should override malformed env: cfg.maxDelay=%s err=%v", cfg.maxDelay, err)
+	}
+	if _, err := parseConfig("serve", nil, io.Discard); err == nil {
+		t.Error("malformed env without an overriding flag should fail")
+	}
 }

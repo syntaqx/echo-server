@@ -1,8 +1,9 @@
 package echo
 
 import (
+	"bytes"
 	_ "embed"
-	"encoding/json"
+	"fmt"
 	"html/template"
 	"net/http"
 	"strings"
@@ -24,25 +25,30 @@ type uiData struct {
 	Nonce  string
 }
 
-// renderHTML writes the browser view. The page carries a strict CSP: only its
-// own nonce-tagged inline style and script may run.
-func (h *Handler) renderHTML(w http.ResponseWriter, status int, e *Echo) {
-	js, _ := json.MarshalIndent(e, "", "  ")
+// renderHTML renders the browser view and sets its headers. The page carries
+// a strict CSP: only its own nonce-tagged inline style and script may run.
+func (h *Handler) renderHTML(hdr http.Header, e *Echo) []byte {
 	nonce := newID()
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Referrer-Policy", "no-referrer")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; "+
+	hdr.Set("Content-Type", "text/html; charset=utf-8")
+	hdr.Set("X-Content-Type-Options", "nosniff")
+	hdr.Set("Referrer-Policy", "no-referrer")
+	hdr.Set("Content-Security-Policy", "default-src 'none'; "+
 		"style-src 'nonce-"+nonce+"'; script-src 'nonce-"+nonce+"'; "+
 		"img-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-	w.WriteHeader(status)
-	_ = uiTemplate.Execute(w, uiData{
+
+	var buf bytes.Buffer
+	if err := uiTemplate.Execute(&buf, uiData{
 		Echo:   e,
-		JSON:   string(js),
+		JSON:   string(marshalJSON(e)),
 		Curl:   curlCommand(e),
 		Prefix: h.opts.RoutePrefix,
 		Nonce:  nonce,
-	})
+	}); err != nil {
+		// The template is static and its data is plain structs; failing here
+		// is a programming error, so make it loud in tests.
+		panic(fmt.Sprintf("echo: rendering HTML view: %v", err))
+	}
+	return buf.Bytes()
 }
 
 // curlCommand reconstructs a curl invocation that replays the request.

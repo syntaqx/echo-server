@@ -98,7 +98,7 @@ func TestValidatePrefix(t *testing.T) {
 func TestCloseStreams(t *testing.T) {
 	h := New(Options{})
 	srv := newHandlerServer(t, h)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
 	ws, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
@@ -141,5 +141,21 @@ func TestCloseStreams(t *testing.T) {
 	}
 	if el := time.Since(start); el > 3*time.Second {
 		t.Errorf("streams took %s to close", el)
+	}
+}
+
+func TestWebSocketAcceptsCrossOrigin(t *testing.T) {
+	srv := newServer(t, Options{})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	for _, origin := range []string{"https://elsewhere.example", "null"} {
+		c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), &websocket.DialOptions{
+			HTTPHeader: http.Header{"Origin": {origin}},
+		})
+		if err != nil {
+			t.Errorf("origin %s rejected: %v", origin, err)
+			continue
+		}
+		_ = c.Close(websocket.StatusNormalClosure, "")
 	}
 }

@@ -15,10 +15,12 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 // Options configures the echo handler. The zero value is usable.
@@ -27,7 +29,9 @@ type Options struct {
 	// Bodies larger than this are truncated in the echo. Defaults to 1 MiB.
 	MaxBodyBytes int64
 
-	// MaxDelay caps the artificial delay a client may request. Defaults to 30s.
+	// MaxDelay caps the artificial delay a client may request. Defaults to
+	// 30s. The handler doesn't change your server's write deadline, so keep
+	// http.Server.WriteTimeout (if set) comfortably above MaxDelay.
 	MaxDelay time.Duration
 
 	// RoutePrefix moves the built-in routes (/healthz, /metrics, /status/...,
@@ -107,15 +111,48 @@ func New(opts Options) *Handler {
 	return h
 }
 
-// ValidatePrefix reports whether p can be used as Options.RoutePrefix.
+// ValidatePrefix reports whether p can be used as Options.RoutePrefix: a
+// clean absolute path such as "/_echo", without wildcards, query or fragment
+// characters, spaces or control characters. A trailing slash is ignored.
 func ValidatePrefix(p string) error {
-	if p == "" {
+	trimmed := strings.TrimSuffix(p, "/")
+	if trimmed == "" {
 		return nil
 	}
-	if !strings.HasPrefix(p, "/") || strings.ContainsAny(p, "{} \t?#") || strings.Contains(p, "//") {
-		return fmt.Errorf("invalid route prefix %q: want a path like /_echo", p)
+	bad := func(reason string) error {
+		return fmt.Errorf("invalid route prefix %q: %s; want a path like /_echo", p, reason)
 	}
-	return nil
+	switch {
+	case !strings.HasPrefix(p, "/"):
+		return bad("must start with /")
+	case strings.ContainsFunc(p, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }):
+		return bad("must not contain spaces or control characters")
+	case strings.ContainsAny(p, "{}?#%"):
+		return bad("must not contain {, }, ?, # or %")
+	case path.Clean(trimmed) != trimmed:
+		return bad("must be a clean path (no //, . or .. segments)")
+	}
+	// Last line of defense: make sure every route registers, so New can't panic.
+	return func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = bad(fmt.Sprint(r))
+			}
+		}()
+		mux := http.NewServeMux()
+		for _, pattern := range routePatterns(trimmed) {
+			mux.HandleFunc(pattern, func(http.ResponseWriter, *http.Request) {})
+		}
+		return nil
+	}()
+}
+
+func routePatterns(p string) []string {
+	return []string{
+		"GET " + p + "/healthz", "GET " + p + "/livez", "GET " + p + "/readyz",
+		"GET " + p + "/metrics", "GET " + p + "/sse", "GET " + p + "/env",
+		p + "/status/{code}", p + "/delay/{duration}",
+	}
 }
 
 // HealthPath is the path of the liveness probe, including any route prefix.
@@ -150,7 +187,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Request-Id", reqID)
 
 	rec := &recorder{ResponseWriter: w, status: http.StatusOK}
-	h.mux.ServeHTTP(rec, r)
+	if isCleanPath(r.URL.Path) {
+		h.mux.ServeHTTP(rec, r)
+	} else {
+		// ServeMux would redirect //a, /a/./b and /a/../b to the cleaned path.
+		// An echo server must show the path exactly as it arrived.
+		h.handleEcho(rec, r)
+	}
+	if !rec.wroteHeader && r.Context().Err() != nil {
+		rec.status = statusClientClosed // client left before we responded
+	}
 
 	elapsed := time.Since(start)
 	h.metrics.observe(r.Method, rec.status, elapsed)
@@ -168,6 +214,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			slog.String("user_agent", r.UserAgent()),
 		)
 	}
+}
+
+// statusClientClosed is recorded in logs and metrics (not sent) when the
+// client disconnects before a response is written, following nginx's 499.
+const statusClientClosed = 499
+
+// isCleanPath reports whether ServeMux would route p without redirecting.
+func isCleanPath(p string) bool {
+	if p == "" || p[0] != '/' {
+		return false
+	}
+	clean := path.Clean(p)
+	if p[len(p)-1] == '/' && clean != "/" {
+		clean += "/"
+	}
+	return clean == p
 }
 
 func (h *Handler) isProbe(path string) bool {

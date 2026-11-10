@@ -18,6 +18,8 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: stable
+      - name: Test
+        run: go test -race ./...
       - uses: goreleaser/goreleaser-action@v7
         with:
           version: '~> v2'
